@@ -1,16 +1,29 @@
-use crseo::{Builder, Diffractive, ShackHartmannBuilder};
-use dos_actors::{clients::{arrow_client::{Arrow}, ceo::{
-    DetectorFrame, OpticalModel, OpticalModelOptions, SegmentPiston, ShackHartmannOptions, WfeRms,
-}}, prelude::*};
+use crseo::{Diffractive, FromBuilder, ShackHartmann};
+use dos_actors::{
+    clients::{
+        arrow_client::{Arrow, Get},
+        ceo::{
+            DetectorFrame, OpticalModel, OpticalModelOptions, SegmentPiston, ShackHartmannOptions,
+            WfeRms,
+        },
+    },
+    prelude::*,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut timer: Initiator<_> = Timer::new(5).into();
+    let n_px_frame = 64;
     let mut optical_model: Actor<_> = (
         OpticalModel::builder()
             .options(vec![OpticalModelOptions::ShackHartmann {
                 options: ShackHartmannOptions::Diffractive(
-                    ShackHartmannBuilder::<Diffractive>::new(),
+                    ShackHartmann::<Diffractive>::builder().detector(
+                        n_px_frame,
+                        None,
+                        Some(4),
+                        None,
+                    ),
                 ),
                 flux_threshold: 0f64,
             }])
@@ -38,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     optical_model
         .add_output()
         .build::<DetectorFrame>()
-        .logn(&mut logs, 512 * 512)
+        .logn(&mut logs, n_px_frame * n_px_frame)
         .await;
 
     Model::new(vec![
@@ -52,6 +65,9 @@ async fn main() -> anyhow::Result<()> {
     .run()
     .wait()
     .await?;
+
+    let data: Vec<Vec<f64>> = (*logging.lock().await).get("WfeRms")?;
+    println!("{:?}", data);
 
     Ok(())
 }
