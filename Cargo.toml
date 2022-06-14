@@ -7,6 +7,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.57"
-crseo = "0.4.0"
-dos-actors = { version = "0.1.12", features = ["ceo", "apache-arrow"] }
+crseo = "0.4.1"
+dos-actors = { version = "0.1.16", features = ["ceo", "apache-arrow"] }
 tokio = "1.18.2"
