@@ -1,4 +1,4 @@
-use crseo::{Atmosphere, Diffractive,Geometric, FromBuilder, ShackHartmann};
+use crseo::{Atmosphere, Diffractive, FromBuilder, Geometric, ShackHartmann};
 use dos_actors::{
     clients::{
         arrow_client::{Arrow, Get},
@@ -12,10 +12,10 @@ use dos_actors::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let atm =  OpticalModelOptions::Atmosphere {
-                    builder: Atmosphere::builder(),
-                    time_step: 5e-3,
-                };
+    let atm = OpticalModelOptions::Atmosphere {
+        builder: Atmosphere::builder(),
+        time_step: 5e-3,
+    };
 
     let mut timer: Initiator<_> = Timer::new(3).into();
     let n_px_frame = 512;
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
                     ),
                     flux_threshold: 0f64,
                 },
-               atm.clone(),
+                atm.clone(),
             ])
             .build()?,
         "On-axis GMT",
@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
             .options(vec![
                 OpticalModelOptions::ShackHartmann {
                     options: ShackHartmannOptions::Geometric(
-                        ShackHartmann::<Geometric>::builder().lenslet_array(60,8,25.5/60.),
+                        ShackHartmann::<Geometric>::builder().lenslet_array(60, 8, 25.5 / 60.),
                     ),
                     flux_threshold: 0.8f64,
                 },
