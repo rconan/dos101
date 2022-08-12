@@ -7,10 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.57"
-crseo = { version = "0.4.3", path = "../crseo" }
-dos-actors = { version = "0.1.20", path = "../dos-actors", features = [
-    "ceo",
-    "apache-arrow",
-] }
+crseo = { version = "0.4.4" }
+dos-actors = { version = "0.1.21", features = ["ceo", "apache-arrow"] }
 nalgebra = "0.31.1"
 tokio = "1.18.2"
