@@ -203,12 +203,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Telemetry logs
     //  . WFE terms
-    let logging = Arrow::builder(n_step).build().into_arcx();
+    let logging = Arrow::builder(n_step)
+        .filename("ngao-logs")
+        .build()
+        .into_arcx();
     let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
     //  . Last wavefronts
     let wavefront_logging = Arrow::builder(1)
         .decimation(n_step)
-        .filename("wavefront")
+        .filename("ngao-wavefront")
         .build()
         .into_arcx();
     let mut wavefront_logs: Terminator<_> =
@@ -298,17 +301,17 @@ async fn main() -> anyhow::Result<()> {
         gmt,
         science
     ])
-    .name("dos101")
+    .name("ngao")
     .flowchart()
     .check()?
     .run();
 
     // Reading out imaging cameras
-    let mut timer: Initiator<_> = Timer::new(0).into();
+    let mut timer: Initiator<_> = Timer::new(0).progress().into();
     let mut on_axis: Actor<_> =
         Actor::new(optical_model.clone()).name("On-axis GMT\nw/ Atmosphere");
     let mut science: Actor<_> = Actor::new(science_path.clone()).name("Science Path");
-    let logging = Arrow::builder(1).filename("frame").build().into_arcx();
+    let logging = Arrow::builder(1).filename("ngao-frame").build().into_arcx();
     let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
 
     timer
@@ -332,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
         .logn(&mut logs, n_px_frame * n_px_frame)
         .await;
     let detector_readouts = Model::new(vec_box!(timer, on_axis, science, logs))
-        .name("images")
+        .name("ngao-images")
         .check()?
         .flowchart();
 
