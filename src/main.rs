@@ -19,6 +19,8 @@ use dos_actors::{
 };
 use na::DMatrix;
 use nalgebra as na;
+use skyangle::SkyAngle;
+use uid_derive::UID;
 use vec_box::vec_box;
 
 pub struct Reconstructor {
@@ -58,129 +60,102 @@ impl Write<Vec<f64>, M2modesRec> for Reconstructor {
 }
 
 #[derive(UID)]
-#[uid(data = "Vec<f32>")]
+#[alias(name = "Wavefront", client = "OpticalModel", traits = "Write,Size")]
 enum ResidualWavefront {}
-impl Write<Vec<f32>, ResidualWavefront> for OpticalModel {
-    fn write(&mut self) -> Option<Arc<Data<ResidualWavefront>>> {
-        let mut data: Arc<Data<Wavefront>> = self.write()?;
-        let inner = Arc::get_mut(&mut data)?;
-        Some(Arc::new(inner.into()))
-    }
-}
-impl Size<ResidualWavefront> for OpticalModel {
-    fn len(&self) -> usize {
-        <Self as Size<Wavefront>>::len(self)
-    }
-}
 #[derive(UID)]
-#[uid(data = "Vec<f32>")]
-enum ReconWavefront {}
-impl Write<Vec<f32>, ReconWavefront> for OpticalModel {
-    fn write(&mut self) -> Option<Arc<Data<ReconWavefront>>> {
-        let mut data: Arc<Data<Wavefront>> = self.write()?;
-        let inner = Arc::get_mut(&mut data)?;
-        Some(Arc::new(inner.into()))
-    }
-}
-impl Size<ReconWavefront> for OpticalModel {
-    fn len(&self) -> usize {
-        <Self as Size<Wavefront>>::len(self)
-    }
-}
-
-#[derive(UID)]
+#[alias(name = "WfeRms", client = "OpticalModel", traits = "Write,Size")]
 enum ResidualWfeRms {}
-impl Write<Vec<f64>, ResidualWfeRms> for OpticalModel {
-    fn write(&mut self) -> Option<Arc<Data<ResidualWfeRms>>> {
-        let mut data: Arc<Data<WfeRms>> = self.write()?;
-        let inner = Arc::get_mut(&mut data)?;
-        Some(Arc::new(inner.into()))
-    }
-}
-impl Size<ResidualWfeRms> for OpticalModel {
-    fn len(&self) -> usize {
-        <Self as Size<WfeRms>>::len(self)
-    }
-}
-
 #[derive(UID)]
+#[alias(name = "SegmentWfeRms", client = "OpticalModel", traits = "Write,Size")]
 enum SegmentResidualWfeRms {}
-impl Write<Vec<f64>, SegmentResidualWfeRms> for OpticalModel {
-    fn write(&mut self) -> Option<Arc<Data<SegmentResidualWfeRms>>> {
-        let mut data: Arc<Data<SegmentWfeRms>> = self.write()?;
-        let inner = Arc::get_mut(&mut data)?;
-        Some(Arc::new(inner.into()))
-    }
-}
-impl Size<SegmentResidualWfeRms> for OpticalModel {
-    fn len(&self) -> usize {
-        <Self as Size<SegmentWfeRms>>::len(self)
-    }
-}
-
 #[derive(UID)]
+#[alias(name = "SegmentPiston", client = "OpticalModel", traits = "Write,Size")]
 enum SegmentResidualPiston {}
-impl Write<Vec<f64>, SegmentResidualPiston> for OpticalModel {
-    fn write(&mut self) -> Option<Arc<Data<SegmentResidualPiston>>> {
-        let mut data: Arc<Data<SegmentPiston>> = self.write()?;
-        let inner = Arc::get_mut(&mut data)?;
-        Some(Arc::new(inner.into()))
-    }
-}
-impl Size<SegmentResidualPiston> for OpticalModel {
-    fn len(&self) -> usize {
-        <Self as Size<SegmentPiston>>::len(self)
-    }
-}
+#[derive(UID)]
+#[alias(name = "Wavefront", client = "OpticalModel", traits = "Write,Size")]
+enum ReconWavefront {}
+#[derive(UID)]
+#[alias(name = "DetectorFrame", client = "OpticalModel", traits = "Write")]
+enum NaturalSeeingImage {}
+#[derive(UID)]
+#[alias(name = "DetectorFrame", client = "OpticalModel", traits = "Write")]
+enum DiffractionLimitedImage {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Atmosphere model
     let atm = OpticalModelOptions::Atmosphere {
-        builder: Atmosphere::builder(),
+        builder: Atmosphere::builder().ray_tracing(
+            25.5,
+            1020,
+            SkyAngle::Arcminute(1f32).to_radians(),
+            3f32,
+            Some("ngao_atmosphere.bin".to_string()),
+            Some(1),
+        ),
         time_step: 1e-3,
     };
 
-    let n_step = 250;
+    // Simulation timer
+    let n_step = 2000;
     let mut timer: Initiator<_> = Timer::new(n_step).into();
 
     let n_px_frame = 512;
 
+    // Imaging camera
     let imgr = OpticalModelOptions::ShackHartmann {
         options: ShackHartmannOptions::Diffractive(ShackHartmann::<Diffractive>::builder()),
         flux_threshold: 0f64,
     };
 
-    let m2_n_mode = 100;
+    // GMT model
+    let m2_n_mode = 200;
     let gmt_builder = Gmt::builder().m2("Karhunen-Loeve", m2_n_mode);
+
+    // [GMT + Atmosphere] optical model
     let optical_model = OpticalModel::builder()
         .gmt(gmt_builder.clone())
-        .options(vec![imgr, atm.clone()])
+        .options(vec![imgr.clone(), atm.clone()])
         .build()?
         .into_arcx();
     let mut on_axis: Actor<_> =
         Actor::new(optical_model.clone()).name("On-axis GMT\nw/ Atmosphere");
-    let mut gmt: Actor<_> = (
-        OpticalModel::builder().gmt(gmt_builder.clone()).build()?,
-        "On-axis GMT\nw/o Atmosphere",
-    )
-        .into();
+    // [GMT + Atmosphere + AO] optical model
+    let science_path = OpticalModel::builder()
+        .gmt(gmt_builder.clone())
+        .options(vec![imgr, atm.clone()])
+        .build()?
+        .into_arcx();
+    let mut science: Terminator<_> = Actor::new(science_path.clone()).name("Science Path");
+    // GMT optical model
+    let gmt_model = OpticalModel::builder()
+        .gmt(gmt_builder.clone())
+        .build()?
+        .into_arcx();
+    let mut gmt: Actor<_> = Actor::new(gmt_model.clone()).name("On-axis GMT\nw/o Atmosphere");
 
+    // Shack-Hartmann WFS
     let wfs_builder = ShackHartmann::<Geometric>::builder().lenslet_array(60, 8, 25.5 / 60.);
     let wfs = OpticalModelOptions::ShackHartmann {
         options: ShackHartmannOptions::Geometric(wfs_builder.clone()),
         flux_threshold: 0.8f64,
     };
+    // Adaptive Optics model
     let mut adaptive_optics = OpticalModel::builder()
         .gmt(gmt_builder)
         .options(vec![wfs, atm])
         .build()?;
 
-    let calib_path = Path::new(format!("pinv_poke_{}.bin", m2_n_mode));
+    // Poke matrix pseudo-inverse
+    let path = format!("pinv_poke_{}.bin", m2_n_mode);
+    let calib_path = Path::new(&path);
     let n_mode = (m2_n_mode - 1) * 7;
     let pinv_poke_mat: DMatrix<f64> = if calib_path.is_file() {
         println!("Loading pseudo-inverse from {:?}", calib_path);
         let mat: Vec<f64> = bincode::deserialize_from(File::open(calib_path)?)?;
         DMatrix::from_column_slice(n_mode, mat.len() / n_mode, &mat)
     } else {
+        // Computing & saving
         println!("Computing AO poke matrix & pseudo-inverse");
         let now = Instant::now();
         let mut calib = Calibration::new(
@@ -221,19 +196,23 @@ async fn main() -> anyhow::Result<()> {
         println!("Saving pseudo-inverse to {:?}", calib_path);
         bincode::serialize_into(File::create(calib_path)?, pinv_poke_mat.as_slice())?;
         pinv_poke_mat
-    }; //   adaptive_optics.sensor_matrix_transform(pinv_poke_mat);
+    };
 
-    let mut ao_actor: Actor<_> = (adaptive_optics, "Adaptive Optics").into();
+    let adaptive_optics = adaptive_optics.into_arcx();
+    let mut ao_actor: Actor<_> = Actor::new(adaptive_optics.clone()).name("Adaptive Optics");
 
+    // Telemetry logs
+    //  . WFE terms
     let logging = Arrow::builder(n_step).build().into_arcx();
     let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
-
-    /*     let ao_logging = Arrow::builder(n_step)
-        .filename("ao_logs")
+    //  . Last wavefronts
+    let wavefront_logging = Arrow::builder(1)
+        .decimation(n_step)
+        .filename("wavefront")
         .build()
         .into_arcx();
-    let mut ao_logs: Terminator<_> = Actor::new(ao_logging.clone()); */
-
+    let mut wavefront_logs: Terminator<_> =
+        Actor::new(wavefront_logging.clone()).name("Wavefront Logs");
     timer
         .add_output()
         .multiplex(2)
@@ -252,15 +231,6 @@ async fn main() -> anyhow::Result<()> {
         .build::<SegmentPiston>()
         .log(&mut logs)
         .await;
-    on_axis
-        .add_output()
-        .build::<Wavefront>()
-        .log(&mut logs)
-        .await;
-    gmt.add_output()
-        .build::<ReconWavefront>()
-        .log(&mut logs)
-        .await;
 
     ao_actor
         .add_output()
@@ -277,12 +247,23 @@ async fn main() -> anyhow::Result<()> {
         .build::<SegmentResidualPiston>()
         .log(&mut logs)
         .await;
+
+    on_axis
+        .add_output()
+        .build::<Wavefront>()
+        .log(&mut wavefront_logs)
+        .await;
+    gmt.add_output()
+        .build::<ReconWavefront>()
+        .log(&mut wavefront_logs)
+        .await;
     ao_actor
         .add_output()
         .build::<ResidualWavefront>()
-        .log(&mut logs)
+        .log(&mut wavefront_logs)
         .await;
 
+    // WFS 2 M2 modes reconstructor
     let mut reconstructor: Actor<_> =
         (Reconstructor::new(pinv_poke_mat), "M2 modes\nreconstructor").into();
     ao_actor
@@ -290,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         .build::<SensorData>()
         .into_input(&mut reconstructor);
 
+    // Control system
     let mut integrator: Actor<_> = Integrator::new(n_mode).gain(0.5).into();
     reconstructor
         .add_output()
@@ -298,46 +280,64 @@ async fn main() -> anyhow::Result<()> {
     integrator
         .add_output()
         .bootstrap()
-        .multiplex(2)
+        .multiplex(3)
         .build::<M2modes>()
         .into_input(&mut ao_actor)
         .into_input(&mut gmt)
+        .into_input(&mut science)
         .confirm()?;
 
-    Model::new(vec_box![
+    let adaptive_optics_system = Model::new(vec_box![
         timer,
         on_axis,
         ao_actor,
         reconstructor,
         integrator,
         logs,
-        gmt
+        wavefront_logs,
+        gmt,
+        science
     ])
     .name("dos101")
     .flowchart()
     .check()?
-    .run()
-    .wait()
-    .await?;
+    .run();
 
+    // Reading out imaging cameras
     let mut timer: Initiator<_> = Timer::new(0).into();
     let mut on_axis: Actor<_> =
         Actor::new(optical_model.clone()).name("On-axis GMT\nw/ Atmosphere");
+    let mut science: Actor<_> = Actor::new(science_path.clone()).name("Science Path");
     let logging = Arrow::builder(1).filename("frame").build().into_arcx();
     let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
 
-    timer.add_output().build::<Tick>().into_input(&mut on_axis);
+    timer
+        .add_output()
+        .multiplex(2)
+        .build::<Tick>()
+        .into_input(&mut on_axis)
+        .into_input(&mut science)
+        .confirm()?;
     on_axis
         .add_output()
         .bootstrap()
-        .build::<DetectorFrame>()
+        .build::<NaturalSeeingImage>()
         .logn(&mut logs, n_px_frame * n_px_frame)
         .await;
-    Model::new(vec_box!(timer, on_axis, logs))
+
+    science
+        .add_output()
+        .bootstrap()
+        .build::<DiffractionLimitedImage>()
+        .logn(&mut logs, n_px_frame * n_px_frame)
+        .await;
+    let detector_readouts = Model::new(vec_box!(timer, on_axis, science, logs))
+        .name("images")
         .check()?
-        .run()
-        .wait()
-        .await?;
+        .flowchart();
+
+    adaptive_optics_system.wait().await?;
+    detector_readouts.run().wait().await?;
 
     Ok(())
 }
