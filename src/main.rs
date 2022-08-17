@@ -27,30 +27,44 @@ pub struct Reconstructor {
     mat: na::DMatrix<f64>,
     u: na::DVector<f64>,
     y: na::DVector<f64>,
+    p2k1: Vec<f64>,
+    p: Vec<f64>,
+    k1: Vec<f64>,
     n_y: usize,
-    n_u: usize,
 }
 impl Reconstructor {
-    pub fn new(mat: na::DMatrix<f64>) -> Self {
+    pub fn new(mat: na::DMatrix<f64>, p2k1: Vec<f64>) -> Self {
         let (n_y, n_u) = mat.shape();
         println!("Reconstructor {:?}", (n_y, n_u));
         Self {
             mat,
             u: na::DVector::zeros(n_u),
             y: na::DVector::zeros(n_y),
+            p2k1,
+            p: vec![0f64; 7],
+            k1: vec![0f64; 7],
             n_y,
-            n_u,
         }
     }
 }
 impl Update for Reconstructor {
     fn update(&mut self) {
         self.y = &self.mat * &self.u;
+        self.k1
+            .iter_mut()
+            .zip(&self.p)
+            .zip(&self.p2k1)
+            .for_each(|((k1, p), p2k1)| *k1 = p * p2k1);
     }
 }
 impl Read<Vec<f64>, SensorData> for Reconstructor {
     fn read(&mut self, data: Arc<Data<SensorData>>) {
         self.u = na::DVector::from_column_slice(&data);
+    }
+}
+impl Read<Vec<f64>, SegmentResidualPiston> for Reconstructor {
+    fn read(&mut self, data: Arc<Data<SegmentResidualPiston>>) {
+        self.p = (&data).to_vec();
     }
 }
 
@@ -62,8 +76,9 @@ impl Write<Vec<f64>, M2modesRec> for Reconstructor {
             self.y
                 .as_slice()
                 .chunks(self.n_y / 7)
-                .flat_map(|y| {
-                    let mut a = vec![0f64];
+                .zip(&self.k1)
+                .flat_map(|(y, &k1)| {
+                    let mut a = vec![k1];
                     a.extend_from_slice(y);
                     a
                 })
@@ -153,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     <OpticalModel as Read<Vec<f64>, M2modes>>::read(&mut gmt_model, Arc::new(Data::new(m2_a)));
     gmt_model.update();
     let piston = <OpticalModel as Write<Vec<f64>, SegmentPiston>>::write(&mut gmt_model).unwrap();
-    let calib_piston: Vec<f64> = piston.iter().map(|x| x * 1e6).collect();
+    let inv_calib_piston: Vec<f64> = piston.iter().map(|x| x * 1e6).map(|x| x.recip()).collect();
     println!("Piston: {:?}", piston);
     let gmt_model = gmt_model.into_arcx();
     let mut gmt: Actor<_> = Actor::new(gmt_model.clone()).name("On-axis GMT\nw/o Atmosphere");
@@ -270,11 +285,6 @@ async fn main() -> anyhow::Result<()> {
         .build::<SegmentResidualWfeRms>()
         .log(&mut logs)
         .await;
-    ao_actor
-        .add_output()
-        .build::<SegmentResidualPiston>()
-        .log(&mut logs)
-        .await;
 
     on_axis
         .add_output()
@@ -292,12 +302,22 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     // WFS 2 M2 modes reconstructor
-    let mut reconstructor: Actor<_> =
-        (Reconstructor::new(pinv_poke_mat), "M2 modes\nreconstructor").into();
+    let mut reconstructor: Actor<_> = (
+        Reconstructor::new(pinv_poke_mat, inv_calib_piston),
+        "M2 modes\nreconstructor",
+    )
+        .into();
     ao_actor
         .add_output()
         .build::<SensorData>()
         .into_input(&mut reconstructor);
+    ao_actor
+        .add_output()
+        .multiplex(2)
+        .build::<SegmentResidualPiston>()
+        .into_input(&mut reconstructor)
+        .log(&mut logs)
+        .await;
 
     // Control system
     let mut integrator: Actor<_> = Integrator::new(n_mode).gain(0.5).into();
