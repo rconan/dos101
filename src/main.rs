@@ -27,14 +27,19 @@ pub struct Reconstructor {
     mat: na::DMatrix<f64>,
     u: na::DVector<f64>,
     y: na::DVector<f64>,
+    n_y: usize,
+    n_u: usize,
 }
 impl Reconstructor {
     pub fn new(mat: na::DMatrix<f64>) -> Self {
         let (n_y, n_u) = mat.shape();
+        println!("Reconstructor {:?}", (n_y, n_u));
         Self {
             mat,
             u: na::DVector::zeros(n_u),
             y: na::DVector::zeros(n_y),
+            n_y,
+            n_u,
         }
     }
 }
@@ -53,9 +58,17 @@ impl Read<Vec<f64>, SensorData> for Reconstructor {
 enum M2modesRec {}
 impl Write<Vec<f64>, M2modesRec> for Reconstructor {
     fn write(&mut self) -> Option<Arc<Data<M2modesRec>>> {
-        let mut data = vec![0f64];
-        data.extend_from_slice(self.y.as_mut_slice());
-        Some(Arc::new(Data::new(data)))
+        Some(Arc::new(Data::new(
+            self.y
+                .as_slice()
+                .chunks(self.n_y / 7)
+                .flat_map(|y| {
+                    let mut a = vec![0f64];
+                    a.extend_from_slice(y);
+                    a
+                })
+                .collect(),
+        )))
     }
 }
 
@@ -110,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     // GMT model
     let m2_n_mode = 200;
+    let n_mode = m2_n_mode * 7;
     let gmt_builder = Gmt::builder().m2("Karhunen-Loeve", m2_n_mode);
 
     // [GMT + Atmosphere] optical model
@@ -128,10 +142,20 @@ async fn main() -> anyhow::Result<()> {
         .into_arcx();
     let mut science: Terminator<_> = Actor::new(science_path.clone()).name("Science Path");
     // GMT optical model
-    let gmt_model = OpticalModel::builder()
-        .gmt(gmt_builder.clone())
-        .build()?
-        .into_arcx();
+    let mut gmt_model = OpticalModel::builder().gmt(gmt_builder.clone()).build()?;
+    let m2_a: Vec<_> = (0..7)
+        .flat_map(|_| {
+            let mut a = vec![0f64; m2_n_mode];
+            a[0] = 1e-6;
+            a
+        })
+        .collect();
+    <OpticalModel as Read<Vec<f64>, M2modes>>::read(&mut gmt_model, Arc::new(Data::new(m2_a)));
+    gmt_model.update();
+    let piston = <OpticalModel as Write<Vec<f64>, SegmentPiston>>::write(&mut gmt_model).unwrap();
+    let calib_piston: Vec<f64> = piston.iter().map(|x| x * 1e6).collect();
+    println!("Piston: {:?}", piston);
+    let gmt_model = gmt_model.into_arcx();
     let mut gmt: Actor<_> = Actor::new(gmt_model.clone()).name("On-axis GMT\nw/o Atmosphere");
 
     // Shack-Hartmann WFS
@@ -149,10 +173,10 @@ async fn main() -> anyhow::Result<()> {
     // Poke matrix pseudo-inverse
     let path = format!("pinv_poke_{}.bin", m2_n_mode);
     let calib_path = Path::new(&path);
-    let n_mode = (m2_n_mode - 1) * 7;
     let pinv_poke_mat: DMatrix<f64> = if calib_path.is_file() {
         println!("Loading pseudo-inverse from {:?}", calib_path);
         let mat: Vec<f64> = bincode::deserialize_from(File::open(calib_path)?)?;
+        let n_mode = (m2_n_mode - 1) * 7;
         DMatrix::from_column_slice(n_mode, mat.len() / n_mode, &mat)
     } else {
         // Computing & saving
@@ -178,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
         );
         let poke: Vec<f64> = calib.poke.into();
 
+        let n_mode = (m2_n_mode - 1) * 7;
         let poke_mat = na::DMatrix::from_column_slice(poke.len() / n_mode, n_mode, &poke);
         let svd = poke_mat.svd(false, false);
         let svals = svd.singular_values.as_slice();
