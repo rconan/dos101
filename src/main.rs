@@ -28,7 +28,6 @@ pub struct Reconstructor {
     u: na::DVector<f64>,
     y: na::DVector<f64>,
     n_y: usize,
-    n_u: usize,
 }
 impl Reconstructor {
     pub fn new(mat: na::DMatrix<f64>) -> Self {
@@ -39,7 +38,6 @@ impl Reconstructor {
             u: na::DVector::zeros(n_u),
             y: na::DVector::zeros(n_y),
             n_y,
-            n_u,
         }
     }
 }
@@ -142,20 +140,10 @@ async fn main() -> anyhow::Result<()> {
         .into_arcx();
     let mut science: Terminator<_> = Actor::new(science_path.clone()).name("Science Path");
     // GMT optical model
-    let mut gmt_model = OpticalModel::builder().gmt(gmt_builder.clone()).build()?;
-    let m2_a: Vec<_> = (0..7)
-        .flat_map(|_| {
-            let mut a = vec![0f64; m2_n_mode];
-            a[0] = 1e-6;
-            a
-        })
-        .collect();
-    <OpticalModel as Read<Vec<f64>, M2modes>>::read(&mut gmt_model, Arc::new(Data::new(m2_a)));
-    gmt_model.update();
-    let piston = <OpticalModel as Write<Vec<f64>, SegmentPiston>>::write(&mut gmt_model).unwrap();
-    let calib_piston: Vec<f64> = piston.iter().map(|x| x * 1e6).collect();
-    println!("Piston: {:?}", piston);
-    let gmt_model = gmt_model.into_arcx();
+    let gmt_model = OpticalModel::builder()
+        .gmt(gmt_builder.clone())
+        .build()?
+        .into_arcx();
     let mut gmt: Actor<_> = Actor::new(gmt_model.clone()).name("On-axis GMT\nw/o Atmosphere");
 
     // Shack-Hartmann WFS
