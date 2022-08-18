@@ -57,12 +57,12 @@ impl Update for Reconstructor {
             .for_each(|((k1, p), p2k1)| *k1 = p * p2k1);
     }
 }
-impl Read<Vec<f64>, SensorData> for Reconstructor {
+impl Read< SensorData> for Reconstructor {
     fn read(&mut self, data: Arc<Data<SensorData>>) {
         self.u = na::DVector::from_column_slice(&data);
     }
 }
-impl Read<Vec<f64>, SegmentResidualPiston> for Reconstructor {
+impl Read< SegmentResidualPiston> for Reconstructor {
     fn read(&mut self, data: Arc<Data<SegmentResidualPiston>>) {
         self.p = (&data).to_vec();
     }
@@ -70,7 +70,7 @@ impl Read<Vec<f64>, SegmentResidualPiston> for Reconstructor {
 
 #[derive(UID)]
 enum M2modesRec {}
-impl Write<Vec<f64>, M2modesRec> for Reconstructor {
+impl Write< M2modesRec> for Reconstructor {
     fn write(&mut self) -> Option<Arc<Data<M2modesRec>>> {
         Some(Arc::new(Data::new(
             self.y
@@ -165,9 +165,9 @@ async fn main() -> anyhow::Result<()> {
             a
         })
         .collect();
-    <OpticalModel as Read<Vec<f64>, M2modes>>::read(&mut gmt_model, Arc::new(Data::new(m2_a)));
+    <OpticalModel as Read< M2modes>>::read(&mut gmt_model, Arc::new(Data::new(m2_a)));
     gmt_model.update();
-    let piston = <OpticalModel as Write<Vec<f64>, SegmentPiston>>::write(&mut gmt_model).unwrap();
+    let piston = <OpticalModel as Write< SegmentPiston>>::write(&mut gmt_model).unwrap();
     let inv_calib_piston: Vec<f64> = piston.iter().map(|x| x * 1e6).map(|x| x.recip()).collect();
     println!("Piston: {:?}", piston);
     let gmt_model = gmt_model.into_arcx();
