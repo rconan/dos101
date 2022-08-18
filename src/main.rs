@@ -46,7 +46,7 @@ impl Update for Reconstructor {
         self.y = &self.mat * &self.u;
     }
 }
-impl Read<Vec<f64>, SensorData> for Reconstructor {
+impl Read< SensorData> for Reconstructor {
     fn read(&mut self, data: Arc<Data<SensorData>>) {
         self.u = na::DVector::from_column_slice(&data);
     }
@@ -54,7 +54,7 @@ impl Read<Vec<f64>, SensorData> for Reconstructor {
 
 #[derive(UID)]
 enum M2modesRec {}
-impl Write<Vec<f64>, M2modesRec> for Reconstructor {
+impl Write<M2modesRec> for Reconstructor {
     fn write(&mut self) -> Option<Arc<Data<M2modesRec>>> {
         Some(Arc::new(Data::new(
             self.y
