@@ -34,7 +34,8 @@ async fn main() -> anyhow::Result<()> {
         flux_threshold: 0f64,
     };
 
-    let gmt_builder = Gmt::builder();
+    let m2_n_mode = 12;
+    let gmt_builder = Gmt::builder().m2("Karhunen-Loeve", m2_n_mode);
     let mut optical_model: Actor<_> = (
         OpticalModel::builder()
             .gmt(gmt_builder.clone())
@@ -61,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         &adaptive_optics.src,
         wfs_builder.clone(),
     );
-    let poker = vec![Some(vec![(Mirror::M2, vec![Segment::Rxyz(1e-6, Some(0..2))])]); 7];
+    let poker = vec![Some(vec![(Mirror::M2MODES, vec![Segment::Modes(1e-6, 1..12)])]); 7];
     calib.calibrate(
         poker,
         crseo::calibrations::ValidLensletCriteria::OtherSensor(
@@ -69,8 +70,17 @@ async fn main() -> anyhow::Result<()> {
         ),
     );
     let poke: Vec<f64> = calib.poke.into();
-    let n_mode = 14;
+    let n_mode = (m2_n_mode - 1) * 7;
+
     let poke_mat = na::DMatrix::from_column_slice(poke.len() / n_mode, n_mode, &poke);
+
+    let svd = poke_mat.svd(false, false);
+    let evals = svd.singular_values.as_slice();
+    let cond = evals[0] / evals.last().unwrap();
+    println!("Cond #: {}", cond);
+
+    let poke_mat = na::DMatrix::from_column_slice(poke.len() / n_mode, n_mode, &poke);
+
     let pinv_poke_mat = poke_mat
         .pseudo_inverse(0.)
         .expect("Failed to compute poke matrix pseudo-inverse");
@@ -79,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         pinv_poke_mat.shape(),
         now.elapsed().as_millis()
     );
-    adaptive_optics.sensor_matrix_transform(pinv_poke_mat);
+    //adaptive_optics.sensor_matrix_transform(pinv_poke_mat);
 
     let mut ao_actor: Actor<_> = (adaptive_optics, "Adaptive Optics").into();
 
@@ -129,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     integrator
         .add_output()
         .bootstrap()
-        .build::<M2rxy>()
+        .build::<M2modes>()
         .into_input(&mut ao_actor)
         .confirm()?;
 
