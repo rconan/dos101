@@ -24,18 +24,18 @@ use uid_derive::UID;
 use vec_box::vec_box;
 
 pub struct Reconstructor {
-    mat: na::DMatrix<f64>,
-    u: na::DVector<f64>,
+    mat: Vec<na::DMatrix<f64>>,
+    u: Vec<f64>,
     y: na::DVector<f64>,
     n_y: usize,
 }
 impl Reconstructor {
-    pub fn new(mat: na::DMatrix<f64>) -> Self {
-        let (n_y, n_u) = mat.shape();
-        println!("Reconstructor {:?}", (n_y, n_u));
+    pub fn new(mat: Vec<na::DMatrix<f64>>) -> Self {
+        let n_y = mat[0].nrows();
+        mat.iter().for_each(|mat| assert_eq!(n_y, mat.nrows()));
         Self {
             mat,
-            u: na::DVector::zeros(n_u),
+            u: vec![],
             y: na::DVector::zeros(n_y),
             n_y,
         }
@@ -43,12 +43,23 @@ impl Reconstructor {
 }
 impl Update for Reconstructor {
     fn update(&mut self) {
-        self.y = &self.mat * &self.u;
+        let mut n_u = self.u.len() / 2;
+        self.y = self
+            .mat
+            .iter()
+            .fold(na::DVector::zeros(self.n_y), |mut y, mat| {
+                let nv = mat.ncols() / 2;
+                let mut s_xy: Vec<f64> = self.u.drain(..nv).collect();
+                n_u -= nv;
+                s_xy.extend(self.u.drain(n_u..n_u + nv));
+                y += mat * na::DVector::from_column_slice(&s_xy);
+                y
+            });
     }
 }
-impl Read< SensorData> for Reconstructor {
+impl Read<SensorData> for Reconstructor {
     fn read(&mut self, data: Arc<Data<SensorData>>) {
-        self.u = na::DVector::from_column_slice(&data);
+        self.u = (&data).to_vec();
     }
 }
 
@@ -65,7 +76,7 @@ impl Write<M2modesRec> for Reconstructor {
                     a.extend_from_slice(y);
                     a
                 })
-                .collect(),
+                .collect::<Vec<f64>>(),
         )))
     }
 }
@@ -92,21 +103,41 @@ enum NaturalSeeingImage {}
 #[alias(name = "DetectorFrame", client = "OpticalModel", traits = "Write")]
 enum DiffractionLimitedImage {}
 
+enum AtmosphereTurbulence {
+    GroundLayer,
+    SevenLayers,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Atmosphere model
-    let atm = OpticalModelOptions::Atmosphere {
-        builder: Atmosphere::builder().ray_tracing(
-            25.5,
-            1020,
-            SkyAngle::Arcminute(1f32).to_radians(),
-            3f32,
-            Some("ngao_atmosphere.bin".to_string()),
-            Some(1),
-        ),
-        time_step: 1e-3,
+    let atm = match AtmosphereTurbulence::SevenLayers {
+        AtmosphereTurbulence::SevenLayers => OpticalModelOptions::Atmosphere {
+            builder: Atmosphere::builder().ray_tracing(
+                25.5,
+                1020,
+                SkyAngle::Arcminute(20f32).to_radians(),
+                3f32,
+                Some("glao_atmosphere.bin".to_string()),
+                Some(1),
+            ),
+            time_step: 1e-3,
+        },
+        AtmosphereTurbulence::GroundLayer => OpticalModelOptions::Atmosphere {
+            builder: Atmosphere::builder()
+                .single_turbulence_layer(0f32, Some(7f32), Some(0f32))
+                .ray_tracing(
+                    25.5,
+                    1020,
+                    SkyAngle::Arcminute(20f32).to_radians(),
+                    3f32,
+                    Some("ground_layer_atmosphere.bin".to_string()),
+                    Some(1),
+                ),
+            time_step: 1e-3,
+        },
+        _ => unimplemented!(),
     };
-
     // Simulation timer
     let n_step = 2000;
     let mut timer: Initiator<_> = Timer::new(n_step).into();
@@ -120,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // GMT model
-    let m2_n_mode = 200;
+    let m2_n_mode = 150;
     let n_mode = m2_n_mode * 7;
     let gmt_builder = Gmt::builder().m2("Karhunen-Loeve", m2_n_mode);
 
@@ -138,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
         .options(vec![imgr, atm.clone()])
         .build()?
         .into_arcx();
-    let mut science: Terminator<_> = Actor::new(science_path.clone()).name("Science Path");
+    let mut science: Actor<_> = Actor::new(science_path.clone()).name("Science Path");
     // GMT optical model
     let gmt_model = OpticalModel::builder()
         .gmt(gmt_builder.clone())
@@ -147,26 +178,45 @@ async fn main() -> anyhow::Result<()> {
     let mut gmt: Actor<_> = Actor::new(gmt_model.clone()).name("On-axis GMT\nw/o Atmosphere");
 
     // Shack-Hartmann WFS
-    let wfs_builder = ShackHartmann::<Geometric>::builder().lenslet_array(60, 8, 25.5 / 60.);
+    let n_sensor = 3;
+    let n_side_lenslet = 48;
+    let wfs_builder = ShackHartmann::<Geometric>::builder()
+        .lenslet_array(n_side_lenslet, 8, 25.5 / n_side_lenslet as f64)
+        .n_sensor(n_sensor);
     let wfs = OpticalModelOptions::ShackHartmann {
         options: ShackHartmannOptions::Geometric(wfs_builder.clone()),
         flux_threshold: 0.8f64,
     };
     // Adaptive Optics model
+    let n_source = n_sensor;
     let mut adaptive_optics = OpticalModel::builder()
         .gmt(gmt_builder)
+        .source(
+            crseo::Source::builder()
+                .size(n_source)
+                .on_ring(SkyAngle::Arcminute(6f32).to_radians()),
+        )
         .options(vec![wfs, atm])
         .build()?;
 
     // Poke matrix pseudo-inverse
-    let path = format!("pinv_poke_{}.bin", m2_n_mode);
+    let path = format!(
+        "pinv_poke_{}mode_{}lensletX{}.bin",
+        m2_n_mode, n_side_lenslet, n_source
+    );
     let calib_path = Path::new(&path);
-    let pinv_poke_mat: DMatrix<f64> = if calib_path.is_file() {
+    let pinv_poke_mat: Vec<DMatrix<f64>> = if calib_path.is_file() {
         println!("Loading pseudo-inverse from {:?}", calib_path);
-        let mat: Vec<f64> = bincode::deserialize_from(File::open(calib_path)?)?;
-        let n_mode = (m2_n_mode - 1) * 7;
-        DMatrix::from_column_slice(n_mode, mat.len() / n_mode, &mat)
+        bincode::deserialize_from(File::open(calib_path)?)?
     } else {
+        let n_valid_lenslet = adaptive_optics
+            .sensor
+            .as_mut()
+            .expect("the AO system is missing a WFS")
+            .n_valid_lenslet();
+        let n_nvl: usize = n_valid_lenslet.iter().cloned().sum();
+        println!("# of valid lenslet: {:?}", n_valid_lenslet);
+
         // Computing & saving
         println!("Computing AO poke matrix & pseudo-inverse");
         let now = Instant::now();
@@ -189,23 +239,37 @@ async fn main() -> anyhow::Result<()> {
             ),
         );
         let poke: Vec<f64> = calib.poke.into();
-
         let n_mode = (m2_n_mode - 1) * 7;
         let poke_mat = na::DMatrix::from_column_slice(poke.len() / n_mode, n_mode, &poke);
-        let svd = poke_mat.svd(false, false);
-        let svals = svd.singular_values.as_slice();
-        let condn = svals[0] / svals.last().unwrap();
-        println!("Condition #: {}", condn);
 
-        let poke_mat = na::DMatrix::from_column_slice(poke.len() / n_mode, n_mode, &poke);
-        let pinv_poke_mat = poke_mat
-            .pseudo_inverse(0.)
-            .expect("Failed to compute poke matrix pseudo-inverse");
-        println!(
-            "pseudo-inverse {:?} computed in {}ms",
-            pinv_poke_mat.shape(),
-            now.elapsed().as_millis()
-        );
+        let mut i = 0usize;
+        let mut pinv_poke_mat = vec![];
+        for &nv in &n_valid_lenslet {
+            let rows: Vec<_> = poke_mat
+                .row_iter()
+                .skip(i)
+                .take(nv)
+                .chain(poke_mat.row_iter().skip(i + n_nvl).take(nv))
+                .collect();
+            i += nv;
+            let sub_poke_mat = na::DMatrix::from_rows(&rows);
+            let svd = sub_poke_mat.svd(false, false);
+            let svals = svd.singular_values.as_slice();
+            let condn = svals[0] / svals.last().unwrap();
+            println!("Condition #: {}", condn);
+
+            let sub_poke_mat = na::DMatrix::from_rows(&rows);
+            pinv_poke_mat.push(
+                sub_poke_mat
+                    .pseudo_inverse(0.)
+                    .expect("Failed to compute poke matrix pseudo-inverse"),
+            );
+            println!(
+                "pseudo-inverse {:?} computed in {}ms",
+                pinv_poke_mat.last().unwrap().shape(),
+                now.elapsed().as_millis()
+            );
+        }
         println!("Saving pseudo-inverse to {:?}", calib_path);
         bincode::serialize_into(File::create(calib_path)?, pinv_poke_mat.as_slice())?;
         pinv_poke_mat
@@ -217,14 +281,14 @@ async fn main() -> anyhow::Result<()> {
     // Telemetry logs
     //  . WFE terms
     let logging = Arrow::builder(n_step)
-        .filename("ngao-logs")
+        .filename("glao-logs")
         .build()
         .into_arcx();
     let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
     //  . Last wavefronts
     let wavefront_logging = Arrow::builder(1)
         .decimation(n_step)
-        .filename("ngao-wavefront")
+        .filename("glao-wavefront")
         .build()
         .into_arcx();
     let mut wavefront_logs: Terminator<_> =
@@ -248,17 +312,17 @@ async fn main() -> anyhow::Result<()> {
         .log(&mut logs)
         .await;
 
-    ao_actor
+    science
         .add_output()
         .build::<ResidualWfeRms>()
         .log(&mut logs)
         .await;
-    ao_actor
+    science
         .add_output()
         .build::<SegmentResidualWfeRms>()
         .log(&mut logs)
         .await;
-    ao_actor
+    science
         .add_output()
         .build::<SegmentResidualPiston>()
         .log(&mut logs)
@@ -273,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
         .build::<ReconWavefront>()
         .log(&mut wavefront_logs)
         .await;
-    ao_actor
+    science
         .add_output()
         .build::<ResidualWavefront>()
         .log(&mut wavefront_logs)
@@ -288,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
         .into_input(&mut reconstructor);
 
     // Control system
+
     let mut integrator: Actor<_> = Integrator::new(n_mode).gain(0.5).into();
     reconstructor
         .add_output()
@@ -312,9 +377,9 @@ async fn main() -> anyhow::Result<()> {
         logs,
         wavefront_logs,
         gmt,
-        science
+        science,
     ])
-    .name("ngao")
+    .name("glao")
     .flowchart()
     .check()?
     .run();
@@ -324,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
     let mut on_axis: Actor<_> =
         Actor::new(optical_model.clone()).name("On-axis GMT\nw/ Atmosphere");
     let mut science: Actor<_> = Actor::new(science_path.clone()).name("Science Path");
-    let logging = Arrow::builder(1).filename("ngao-frame").build().into_arcx();
+    let logging = Arrow::builder(1).filename("glao-frame").build().into_arcx();
     let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
 
     timer
@@ -348,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
         .logn(&mut logs, n_px_frame * n_px_frame)
         .await;
     let detector_readouts = Model::new(vec_box!(timer, on_axis, science, logs))
-        .name("ngao-images")
+        .name("glao-images")
         .check()?
         .flowchart();
 
