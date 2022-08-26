@@ -13,6 +13,7 @@ dos-actors = { version = "1.0.1", path = "../dos-actors", features = [
     "ceo",
     "apache-arrow",
 ] }
+env_logger = "0.9.0"
 nalgebra = "0.31.1"
 skyangle = "0.1.2"
 tokio = "1.18.2"

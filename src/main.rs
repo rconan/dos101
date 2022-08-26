@@ -8,8 +8,8 @@ use dos_actors::{
     clients::{
         arrow_client::Arrow,
         ceo::{
-            DetectorFrame, M2modes, OpticalModel, OpticalModelOptions, SegmentPiston,
-            SegmentWfeRms, SensorData, ShackHartmannOptions, Wavefront, WfeRms,
+            DetectorFrame, M2modes, OpticalModel, OpticalModelOptions, PSSnFwhm, PSSnOptions,
+            SegmentPiston, SegmentWfeRms, SensorData, ShackHartmannOptions, Wavefront, WfeRms,
         },
         Integrator,
     },
@@ -103,6 +103,14 @@ enum NaturalSeeingImage {}
 #[alias(name = "DetectorFrame", client = "OpticalModel", traits = "Write")]
 enum DiffractionLimitedImage {}
 
+#[derive(UID)]
+#[alias(name = "PSSnFwhm", client = "OpticalModel", traits = "Write,Size")]
+enum NaturalSeeingPSSnFwhm {}
+#[derive(UID)]
+#[alias(name = "PSSnFwhm", client = "OpticalModel", traits = "Write,Size")]
+enum GlaoPSSnFwhm {}
+
+#[allow(dead_code)]
 enum AtmosphereTurbulence {
     GroundLayer,
     SevenLayers,
@@ -110,6 +118,12 @@ enum AtmosphereTurbulence {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
+    // GLAO definition
+    let n_sensor = 3;
+    let guide_star_z_arcmin = 6f32;
+
     // Atmosphere model
     let atm = match AtmosphereTurbulence::SevenLayers {
         AtmosphereTurbulence::SevenLayers => OpticalModelOptions::Atmosphere {
@@ -117,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 25.5,
                 1020,
                 SkyAngle::Arcminute(20f32).to_radians(),
-                3f32,
+                6f32,
                 Some("glao_atmosphere.bin".to_string()),
                 Some(1),
             ),
@@ -130,17 +144,16 @@ async fn main() -> anyhow::Result<()> {
                     25.5,
                     1020,
                     SkyAngle::Arcminute(20f32).to_radians(),
-                    3f32,
+                    6f32,
                     Some("ground_layer_atmosphere.bin".to_string()),
                     Some(1),
                 ),
             time_step: 1e-3,
         },
-        _ => unimplemented!(),
     };
     // Simulation timer
-    let n_step = 2000;
-    let mut timer: Initiator<_> = Timer::new(n_step).into();
+    let n_step = 5000;
+    let mut timer: Initiator<_> = Timer::new(n_step).progress().into();
 
     let n_px_frame = 512;
 
@@ -151,14 +164,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // GMT model
-    let m2_n_mode = 150;
+    let m2_n_mode = 100;
     let n_mode = m2_n_mode * 7;
     let gmt_builder = Gmt::builder().m2("Karhunen-Loeve", m2_n_mode);
+
+    let pssn = OpticalModelOptions::PSSn(PSSnOptions::AtmosphereTelescope(crseo::PSSn::builder()));
 
     // [GMT + Atmosphere] optical model
     let optical_model = OpticalModel::builder()
         .gmt(gmt_builder.clone())
-        .options(vec![imgr.clone(), atm.clone()])
+        .options(vec![imgr.clone(), atm.clone(), pssn.clone()])
         .build()?
         .into_arcx();
     let mut on_axis: Actor<_> =
@@ -166,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     // [GMT + Atmosphere + AO] optical model
     let science_path = OpticalModel::builder()
         .gmt(gmt_builder.clone())
-        .options(vec![imgr, atm.clone()])
+        .options(vec![imgr, atm.clone(), pssn])
         .build()?
         .into_arcx();
     let mut science: Actor<_> = Actor::new(science_path.clone()).name("Science Path");
@@ -178,7 +193,6 @@ async fn main() -> anyhow::Result<()> {
     let mut gmt: Actor<_> = Actor::new(gmt_model.clone()).name("On-axis GMT\nw/o Atmosphere");
 
     // Shack-Hartmann WFS
-    let n_sensor = 3;
     let n_side_lenslet = 48;
     let wfs_builder = ShackHartmann::<Geometric>::builder()
         .lenslet_array(n_side_lenslet, 8, 25.5 / n_side_lenslet as f64)
@@ -194,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
         .source(
             crseo::Source::builder()
                 .size(n_source)
-                .on_ring(SkyAngle::Arcminute(6f32).to_radians()),
+                .on_ring(SkyAngle::Arcminute(guide_star_z_arcmin).to_radians()),
         )
         .options(vec![wfs, atm])
         .build()?;
@@ -384,38 +398,52 @@ async fn main() -> anyhow::Result<()> {
     .check()?
     .run();
 
-    // Reading out imaging cameras
-    let mut timer: Initiator<_> = Timer::new(0).progress().into();
-    let mut on_axis: Actor<_> =
-        Actor::new(optical_model.clone()).name("On-axis GMT\nw/ Atmosphere");
-    let mut science: Actor<_> = Actor::new(science_path.clone()).name("Science Path");
-    let logging = Arrow::builder(1).filename("glao-frame").build().into_arcx();
-    let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
+    let detector_readouts = {
+        // Reading out imaging cameras
+        let mut timer: Initiator<_> = Timer::new(0).into();
+        let mut on_axis: Actor<_> =
+            Actor::new(optical_model.clone()).name("On-axis GMT\nw/ Atmosphere");
+        let mut science: Actor<_> = Actor::new(science_path.clone()).name("Science Path");
+        let logging = Arrow::builder(1).filename("glao-frame").build().into_arcx();
+        let mut logs: Terminator<_> = Actor::new(logging.clone()).name("Logs");
 
-    timer
-        .add_output()
-        .multiplex(2)
-        .build::<Tick>()
-        .into_input(&mut on_axis)
-        .into_input(&mut science)
-        .confirm()?;
-    on_axis
-        .add_output()
-        .bootstrap()
-        .build::<NaturalSeeingImage>()
-        .logn(&mut logs, n_px_frame * n_px_frame)
-        .await;
+        timer
+            .add_output()
+            .multiplex(2)
+            .build::<Tick>()
+            .into_input(&mut on_axis)
+            .into_input(&mut science)
+            .confirm()?;
+        on_axis
+            .add_output()
+            .bootstrap()
+            .build::<NaturalSeeingImage>()
+            .logn(&mut logs, n_px_frame * n_px_frame)
+            .await;
+        on_axis
+            .add_output()
+            .bootstrap()
+            .build::<NaturalSeeingPSSnFwhm>()
+            .log(&mut logs)
+            .await;
 
-    science
-        .add_output()
-        .bootstrap()
-        .build::<DiffractionLimitedImage>()
-        .logn(&mut logs, n_px_frame * n_px_frame)
-        .await;
-    let detector_readouts = Model::new(vec_box!(timer, on_axis, science, logs))
-        .name("glao-images")
-        .check()?
-        .flowchart();
+        science
+            .add_output()
+            .bootstrap()
+            .build::<DiffractionLimitedImage>()
+            .logn(&mut logs, n_px_frame * n_px_frame)
+            .await;
+        science
+            .add_output()
+            .bootstrap()
+            .build::<GlaoPSSnFwhm>()
+            .log(&mut logs)
+            .await;
+        Model::new(vec_box!(timer, on_axis, science, logs))
+            .name("glao-images")
+            .check()?
+            .flowchart()
+    };
 
     adaptive_optics_system.wait().await?;
     detector_readouts.run().wait().await?;
