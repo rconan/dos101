@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use crseo::{
     calibrations::{Mirror, Segment},
@@ -8,14 +8,68 @@ use dos_actors::{
     clients::{
         arrow_client::{Arrow, Get},
         ceo::{
-            DetectorFrame, M2rxy, OpticalModel, OpticalModelOptions, SegmentPiston, SensorData,
-            ShackHartmannOptions, WfeRms,
+            DetectorFrame, M2modes, M2rxy, OpticalModel, OpticalModelOptions, SegmentPiston,
+            SensorData, ShackHartmannOptions, WfeRms,
         },
         Integrator,
     },
+    io::{Data, Read, Write},
     prelude::*,
+    Update,
 };
 use nalgebra as na;
+
+// Reconstructor
+// y = mat * u
+// u : centroids
+// mat: pseudo-inverse
+// y: KL modes (7*11)
+// y = [y1,y2,y3,y4,y5,y6,y7]
+// y = [0,y1,0,y2,0,y3,0,y4,0,y5,0,y6,0,y7]
+pub struct Reconstructor {
+    mat: na::DMatrix<f64>,
+    y: na::DVector<f64>,
+    u: na::DVector<f64>,
+}
+impl Reconstructor {
+    fn new(mat: na::DMatrix<f64>) -> Self {
+        let (n_y, n_u) = mat.shape();
+        Self {
+            mat,
+            y: na::DVector::zeros(n_y),
+            u: na::DVector::zeros(n_u),
+        }
+    }
+}
+impl Update for Reconstructor {
+    fn update(&mut self) {
+        self.y = &self.mat * &self.u;
+    }
+}
+impl Read<SensorData> for Reconstructor {
+    fn read(&mut self, data: Arc<Data<SensorData>>) {
+        let u: &[f64] = &data;
+        self.u = na::DVector::from_column_slice(u);
+    }
+}
+
+#[derive(UID)]
+enum M2modesRecon {}
+impl Write<M2modesRecon> for Reconstructor {
+    fn write(&mut self) -> Option<Arc<Data<M2modesRecon>>> {
+        let data: Vec<_> = self
+            .y
+            .as_slice()
+            .chunks(self.y.len() / 7)
+            .flat_map(|y| {
+                let mut v = vec![0f64];
+                v.extend_from_slice(y);
+                v
+            })
+            .collect();
+        Some(Arc::new(Data::new(data)))
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -132,9 +186,15 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     let mut integrator: Actor<_> = Integrator::new(n_mode).gain(0.5).into();
+    let mut recon: Actor<_> = Reconstructor::new(pinv_poke_mat).into();
+
     ao_actor
         .add_output()
         .build::<SensorData>()
+        .into_input(&mut recon);
+    recon
+        .add_output()
+        .build::<M2modesRecon>()
         .into_input(&mut integrator);
     integrator
         .add_output()
@@ -147,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         Box::new(timer),
         Box::new(optical_model),
         Box::new(ao_actor),
+        Box::new(recon),
         Box::new(integrator),
         Box::new(logs),
         Box::new(ao_logs),

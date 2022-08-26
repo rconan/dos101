@@ -7,7 +7,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.57"
-crseo = { version = "0.4.4" }
-dos-actors = { version = "0.1.21", features = ["ceo", "apache-arrow"] }
+crseo = { version = "0.4.5" }
+dos-actors = { version = "1.0.2", features = ["ceo", "apache-arrow"] }
 nalgebra = "0.31.1"
 tokio = "1.18.2"
+uid = { version = "0.1.1", package = "dos-uid" }
+uid-derive = { version = "0.3.0", package = "dos-uid-derive" }

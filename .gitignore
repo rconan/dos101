@@ -3,3 +3,5 @@ Cargo.lock
 *.parquet
 *.dot*
 data/
+*.bin
+*.png
