@@ -15,7 +15,7 @@ use dos_actors::{
     },
     io::{Data, Read, Write},
     prelude::*,
-    Update,
+    Size, Update,
 };
 use nalgebra as na;
 
@@ -71,6 +71,10 @@ impl Write<M2modesRecon> for Reconstructor {
     }
 }
 
+#[derive(UID)]
+#[alias(name = "WfeRms", client = "OpticalModel", traits = "Write,Size")]
+enum ResidualWfeRms {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let atm = OpticalModelOptions::Atmosphere {
@@ -90,14 +94,12 @@ async fn main() -> anyhow::Result<()> {
 
     let m2_n_mode = 12;
     let gmt_builder = Gmt::builder().m2("Karhunen-Loeve", m2_n_mode);
-    let mut optical_model: Actor<_> = (
-        OpticalModel::builder()
-            .gmt(gmt_builder.clone())
-            .options(vec![imgr, atm.clone()])
-            .build()?,
-        "On-axis GMT",
-    )
-        .into();
+    let mut on_axis = OpticalModel::builder()
+        .gmt(gmt_builder.clone())
+        .options(vec![imgr, atm.clone()])
+        .build()?
+        .into_arcx();
+    let mut optical_model: Actor<_> = Actor::new(on_axis.clone()).name("On-axis GMT");
 
     let wfs_builder = ShackHartmann::<Geometric>::builder().lenslet_array(60, 8, 25.5 / 60.);
     let wfs = OpticalModelOptions::ShackHartmann {
@@ -150,11 +152,11 @@ async fn main() -> anyhow::Result<()> {
     let logging = Arrow::builder(n_step).filename("logs").build().into_arcx();
     let mut logs: Terminator<_> = Actor::new(logging.clone());
 
-    let ao_logging = Arrow::builder(n_step)
+    /*     let ao_logging = Arrow::builder(n_step)
         .filename("ao_logs")
         .build()
         .into_arcx();
-    let mut ao_logs: Terminator<_> = Actor::new(ao_logging.clone());
+    let mut ao_logs: Terminator<_> = Actor::new(ao_logging.clone()); */
 
     timer
         .add_output()
@@ -173,16 +175,16 @@ async fn main() -> anyhow::Result<()> {
         .build::<SegmentPiston>()
         .log(&mut logs)
         .await;
-    optical_model
-        .add_output()
-        .build::<DetectorFrame>()
-        .logn(&mut logs, n_px_frame * n_px_frame)
-        .await;
+    /*     optical_model
+    .add_output()
+    .build::<DetectorFrame>()
+    .logn(&mut logs, n_px_frame * n_px_frame)
+    .await; */
 
     ao_actor
         .add_output()
-        .build::<WfeRms>()
-        .log(&mut ao_logs)
+        .build::<ResidualWfeRms>()
+        .log(&mut logs)
         .await;
 
     let mut integrator: Actor<_> = Integrator::new(n_mode).gain(0.5).into();
@@ -203,25 +205,55 @@ async fn main() -> anyhow::Result<()> {
         .into_input(&mut ao_actor)
         .confirm()?;
 
-    Model::new(vec![
+    let mut ao_model = Model::new(vec![
         Box::new(timer),
         Box::new(optical_model),
         Box::new(ao_actor),
         Box::new(recon),
         Box::new(integrator),
         Box::new(logs),
-        Box::new(ao_logs),
     ])
     .name("dos101")
+    .flowchart()
+    .check()?
+    .run();
+
+    let logging = Arrow::builder(n_step)
+        .filename("last_frame")
+        .build()
+        .into_arcx();
+    let mut logs: Terminator<_> = Actor::new(logging.clone());
+    let mut optical_model: Actor<_> = Actor::new(on_axis.clone()).name("On-axis GMT");
+    let mut timer: Initiator<_> = Timer::new(0).into();
+
+    timer
+        .add_output()
+        .build::<Tick>()
+        .into_input(&mut optical_model);
+    optical_model
+        .add_output()
+        .bootstrap()
+        .build::<DetectorFrame>()
+        .logn(&mut logs, 512 * 512)
+        .await;
+
+    ao_model.wait().await;
+
+    Model::new(vec![
+        Box::new(timer),
+        Box::new(optical_model),
+        Box::new(logs),
+    ])
+    .name("dos101-frame")
     .flowchart()
     .check()?
     .run()
     .wait()
     .await?;
-
+    /*
     let data: Vec<Vec<f64>> = (*logging.lock().await).get("WfeRms")?;
     println!("{:?}", data);
     let data: Vec<Vec<f64>> = (*ao_logging.lock().await).get("WfeRms")?;
-    println!("{:?}", data);
+    println!("{:?}", data); */
     Ok(())
 }
