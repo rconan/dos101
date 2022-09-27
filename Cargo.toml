@@ -8,15 +8,13 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.57"
 bincode = "1.3.3"
-crseo = { version = "0.4.4", path = "../crseo" }
-dos-actors = { version = "1.0.1", path = "../dos-actors", features = [
-    "ceo",
-    "apache-arrow",
-] }
+crseo-client = { version = "0.1.0", path = "../dos-actors/clients/crseo", package = "gmt_dos-clients_crseo" }
+crseo = { version = "0.4.5" }
+dos-actors = { version = "3.0.1", path = "../dos-actors", package = "gmt_dos-actors" }
 env_logger = "0.9.0"
 nalgebra = "0.31.1"
+rand = "0.8.5"
 skyangle = "0.1.2"
 tokio = "1.18.2"
-uid = { version = "0.1.1", package = "dos-uid" }
-uid-derive = { version = "0.3.0", package = "dos-uid-derive" }
 vec_box = "1.0.0"
+arrow = { version = "0.1.0", path = "../dos-actors/clients/arrow", package = "gmt_dos-clients_arrow" }

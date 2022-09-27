@@ -1,26 +1,23 @@
 use std::{fs::File, path::Path, sync::Arc, time::Instant};
 
+use arrow::Arrow;
 use crseo::{
     calibrations::{Mirror, Segment},
     Atmosphere, Calibration, Diffractive, FromBuilder, Geometric, Gmt, ShackHartmann,
 };
+use crseo_client::{
+    DetectorFrame, M2modes, OpticalModel, OpticalModelOptions, PSSnFwhm, PSSnOptions,
+    SegmentPiston, SegmentWfeRms, SensorData, ShackHartmannOptions, Wavefront, WfeRms,
+};
 use dos_actors::{
-    clients::{
-        arrow_client::Arrow,
-        ceo::{
-            DetectorFrame, M2modes, OpticalModel, OpticalModelOptions, PSSnFwhm, PSSnOptions,
-            SegmentPiston, SegmentWfeRms, SensorData, ShackHartmannOptions, Wavefront, WfeRms,
-        },
-        Integrator,
-    },
-    io::{Data, Read, Write},
+    clients::Integrator,
+    io::{Data, Read, UniqueIdentifier, Write},
     prelude::*,
-    Size, Update,
+    Update, UID,
 };
 use na::DMatrix;
 use nalgebra as na;
 use skyangle::SkyAngle;
-use uid_derive::UID;
 use vec_box::vec_box;
 
 pub struct Reconstructor {
@@ -114,27 +111,60 @@ enum GlaoPSSnFwhm {}
 enum AtmosphereTurbulence {
     GroundLayer,
     SevenLayers,
+    Free,
 }
+
+/*
+V PSSN:
+ 5s: 1.0722716460275097
+20s: 1.0769400413982648
+30s: 1.0813146673524834
+H PSSN
+ 5s: 1.0042458409428772
+30s: 1.02788736839214
+*/
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
+    let sim_duration = 5_usize;
+    let atm_sampling_frequency = 1000_usize;
+    const AO_RATE: usize = 10;
+
     // GLAO definition
     let n_sensor = 3;
     let guide_star_z_arcmin = 6f32;
 
+    // Science definition
+    let src = crseo::Source::builder().band("V");
+
     // Atmosphere model
-    let atm = match AtmosphereTurbulence::SevenLayers {
+    let atm_duration = 1f32;
+    let atm_n_duration = 31;
+    let atm = match AtmosphereTurbulence::Free {
         AtmosphereTurbulence::SevenLayers => OpticalModelOptions::Atmosphere {
             builder: Atmosphere::builder().ray_tracing(
                 25.5,
                 1020,
                 SkyAngle::Arcminute(20f32).to_radians(),
-                6f32,
+                atm_duration,
                 Some("glao_atmosphere.bin".to_string()),
-                Some(1),
+                Some(atm_n_duration),
             ),
+            time_step: 1e-3,
+        },
+        AtmosphereTurbulence::Free => OpticalModelOptions::Atmosphere {
+            builder: Atmosphere::builder()
+                .ray_tracing(
+                    25.5,
+                    1020,
+                    SkyAngle::Arcminute(20f32).to_radians(),
+                    atm_duration,
+                    Some("glao_free-atmosphere.bin".to_string()),
+                    Some(atm_n_duration),
+                )
+                .remove_turbulence_layer(0),
             time_step: 1e-3,
         },
         AtmosphereTurbulence::GroundLayer => OpticalModelOptions::Atmosphere {
@@ -144,15 +174,15 @@ async fn main() -> anyhow::Result<()> {
                     25.5,
                     1020,
                     SkyAngle::Arcminute(20f32).to_radians(),
-                    6f32,
+                    atm_duration,
                     Some("ground_layer_atmosphere.bin".to_string()),
-                    Some(1),
+                    Some(atm_n_duration),
                 ),
             time_step: 1e-3,
         },
     };
     // Simulation timer
-    let n_step = 5000;
+    let n_step = sim_duration * atm_sampling_frequency;
     let mut timer: Initiator<_> = Timer::new(n_step).progress().into();
 
     let n_px_frame = 512;
@@ -168,12 +198,29 @@ async fn main() -> anyhow::Result<()> {
     let n_mode = m2_n_mode * 7;
     let gmt_builder = Gmt::builder().m2("Karhunen-Loeve", m2_n_mode);
 
-    let pssn = OpticalModelOptions::PSSn(PSSnOptions::AtmosphereTelescope(crseo::PSSn::builder()));
+    let pssn = OpticalModelOptions::PSSn(PSSnOptions::AtmosphereTelescope(
+        crseo::PSSn::builder().source(src.clone()),
+    ));
 
     // [GMT + Atmosphere] optical model
     let optical_model = OpticalModel::builder()
         .gmt(gmt_builder.clone())
-        .options(vec![imgr.clone(), atm.clone(), pssn.clone()])
+        .source(src.clone())
+        .options(vec![
+            imgr.clone(),
+            OpticalModelOptions::Atmosphere {
+                builder: Atmosphere::builder().ray_tracing(
+                    25.5,
+                    1020,
+                    SkyAngle::Arcminute(20f32).to_radians(),
+                    atm_duration,
+                    Some("glao_atmosphere.bin".to_string()),
+                    Some(atm_n_duration),
+                ),
+                time_step: 1e-3,
+            },
+            pssn.clone(),
+        ])
         .build()?
         .into_arcx();
     let mut on_axis: Actor<_> =
@@ -181,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
     // [GMT + Atmosphere + AO] optical model
     let science_path = OpticalModel::builder()
         .gmt(gmt_builder.clone())
+        .source(src)
         .options(vec![imgr, atm.clone(), pssn])
         .build()?
         .into_arcx();
@@ -221,7 +269,11 @@ async fn main() -> anyhow::Result<()> {
     let calib_path = Path::new(&path);
     let pinv_poke_mat: Vec<DMatrix<f64>> = if calib_path.is_file() {
         println!("Loading pseudo-inverse from {:?}", calib_path);
-        bincode::deserialize_from(File::open(calib_path)?)?
+        let data: Vec<((usize, usize), Vec<f64>)> =
+            bincode::deserialize_from(File::open(calib_path)?)?;
+        data.into_iter()
+            .map(|((n, m), x)| DMatrix::from_column_slice(n, m, x.as_slice()))
+            .collect()
     } else {
         let n_valid_lenslet = adaptive_optics
             .sensor
@@ -285,12 +337,17 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         println!("Saving pseudo-inverse to {:?}", calib_path);
-        bincode::serialize_into(File::create(calib_path)?, pinv_poke_mat.as_slice())?;
+        let data: Vec<((usize, usize), Vec<f64>)> = pinv_poke_mat
+            .iter()
+            .map(|x| (x.shape(), x.as_slice().to_vec()))
+            .collect();
+        bincode::serialize_into(File::create(calib_path)?, &data)?;
         pinv_poke_mat
     };
 
     let adaptive_optics = adaptive_optics.into_arcx();
-    let mut ao_actor: Actor<_> = Actor::new(adaptive_optics.clone()).name("Adaptive Optics");
+    let mut ao_actor: Actor<_, 1, AO_RATE> =
+        Actor::new(adaptive_optics.clone()).name("Adaptive Optics");
 
     // Telemetry logs
     //  . WFE terms
@@ -358,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     // WFS 2 M2 modes reconstructor
-    let mut reconstructor: Actor<_> =
+    let mut reconstructor: Actor<_, AO_RATE, AO_RATE> =
         (Reconstructor::new(pinv_poke_mat), "M2 modes\nreconstructor").into();
     ao_actor
         .add_output()
@@ -367,7 +424,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Control system
 
-    let mut integrator: Actor<_> = Integrator::new(n_mode).gain(0.5).into();
+    let mut integrator: Actor<_, AO_RATE, 1> = Integrator::new(n_mode).gain(0.5).into();
     reconstructor
         .add_output()
         .build::<M2modesRec>()
